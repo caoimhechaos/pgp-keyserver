@@ -1,0 +1,3 @@
+create keyspace pgpkeys with placement_strategy = 'org.apache.cassandra.locator.SimpleStrategy' and strategy_options = {replication_factor:1};
+use pgpkeys;
+create column family keys with key_validation_class = 'BytesType' and comparator = 'AsciiType' and column_metadata = [{column_name: keydata, validation_class: BytesType, index_type: 0}];

@@ -31,20 +31,29 @@
 package main
 
 import (
+	"database/cassandra"
+	"errors"
 	"expvar"
 	"log"
 	"net/http"
 	"strings"
+	"time"
+
+	"code.google.com/p/go.crypto/openpgp"
 )
 
 var pksreqs *expvar.Int = expvar.NewInt("num-pks-reqs")
 var pksunknownreqs *expvar.Int = expvar.NewInt("num-pks-unknown-reqs")
 var pksaddreqs *expvar.Int = expvar.NewInt("num-pks-add-reqs")
 var pkslookupreqs *expvar.Int = expvar.NewInt("num-pks-lookup-reqs")
+var pksaddrequesterrors *expvar.Map = expvar.NewMap("num-pkcs-add-request-errors")
+var pksadderrors *expvar.Map = expvar.NewMap("num-pkcs-add-errors")
 
 // The handler for requests to /pks. Will distribute them automatically by
 // request type; can be used as an HTTP handler directly
 type PksHandler struct {
+	client   *cassandra.RetryCassandraClient
+	keyspace string
 	http.Handler
 }
 
@@ -52,12 +61,112 @@ type PksHandler struct {
 // querying the given "keyspace". Will return the newly setup PKS handler
 // or an error indicating why it failed.
 func NewPksHandler(dbserver, keyspace string) (*PksHandler, error) {
-	return &PksHandler{}, nil
+	var err error
+	var client *cassandra.RetryCassandraClient
+
+	client, err = cassandra.NewRetryCassandraClientTimeout(dbserver,
+		10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+
+	ire, err := client.SetKeyspace(keyspace)
+	if ire != nil {
+		return nil, errors.New("Error setting keyspace to " + keyspace +
+			": " + ire.Why)
+	}
+	if err != nil {
+		return nil, errors.New("Error setting keyspace to " + keyspace +
+			": " + err.Error())
+	}
+	return &PksHandler{
+		client:   client,
+		keyspace: keyspace,
+	}, nil
+}
+
+// Add the given "keydata" as a new key to the database. If this fails, a
+// descriptive error message is returned as error and the int is set to
+// the appropriate HTTP response code.
+func (self *PksHandler) Add(keydata string) (error, int) {
+	var ts int64 = time.Now().Unix()
+	var entities openpgp.EntityList
+	var entity *openpgp.Entity
+	var err error
+
+	// Read all keys from the input; there can be multiple and we still
+	// wouldn't care.
+	entities, err = openpgp.ReadArmoredKeyRing(strings.NewReader(keydata))
+	if err != nil {
+		log.Print("Unable to decode armored key ring: ", err)
+		pksaddrequesterrors.Add("invalid-armored-key", 1)
+		return err, http.StatusBadRequest
+	}
+
+	for _, entity = range entities {
+		var mmap map[string]map[string][]*cassandra.Mutation
+		var mutations []*cassandra.Mutation
+		var mutation *cassandra.Mutation
+		var col *cassandra.Column
+
+		var ire *cassandra.InvalidRequestException
+		var ue *cassandra.UnavailableException
+		var te *cassandra.TimedOutException
+
+		// Reverse the fingerprint so it can be used as a key.
+		var rev_fp []byte = make([]byte, len(entity.PrimaryKey.Fingerprint))
+		for i, x := range entity.PrimaryKey.Fingerprint {
+			rev_fp[len(entity.PrimaryKey.Fingerprint)-i-1] = x
+		}
+
+		col = cassandra.NewColumn()
+		col.Name = []byte("keydata")
+		col.Value = []byte(keydata)
+		col.Timestamp = ts
+		mutation = cassandra.NewMutation()
+		mutation.ColumnOrSupercolumn = cassandra.NewColumnOrSuperColumn()
+		mutation.ColumnOrSupercolumn.Column = col
+		mutations = append(mutations, mutation)
+
+		mmap = make(map[string]map[string][]*cassandra.Mutation)
+		mmap[string(rev_fp)] = make(map[string][]*cassandra.Mutation)
+		mmap[string(rev_fp)]["keys"] = mutations
+
+		ire, ue, te, err = self.client.BatchMutate(mmap,
+			cassandra.ConsistencyLevel_ONE)
+		if ire != nil {
+			log.Println("Invalid request: ", ire.Why)
+			pksadderrors.Add("invalid-request", 1)
+			err = errors.New(ire.String())
+			return err, http.StatusInternalServerError
+		}
+		if ue != nil {
+			log.Println("Unavailable")
+			pksadderrors.Add("unavailable", 1)
+			err = errors.New(ue.String())
+			return err, http.StatusInternalServerError
+		}
+		if te != nil {
+			log.Println("Request to database backend timed out")
+			pksadderrors.Add("timeout", 1)
+			err = errors.New(te.String())
+			return err, http.StatusInternalServerError
+		}
+		if err != nil {
+			log.Println("Generic error: ", err)
+			pksadderrors.Add("os-error", 1)
+			err = errors.New(err.Error())
+			return err, http.StatusInternalServerError
+		}
+	}
+	// FIXME: stub
+	return nil, http.StatusCreated
 }
 
 // HTTP response generator of the PKS handler.
-func (*PksHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (self *PksHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var err error
+	var status int
 	var ops []string = strings.Split(r.RequestURI, "/")
 	var op string
 
@@ -92,16 +201,29 @@ func (*PksHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			log.Print("Requested operation ", op, " not supported")
 			http.Error(w, "Requested operation "+op+" not supported",
 				http.StatusBadRequest)
+			return
 		}
 	case "add":
 		{
 			pksaddreqs.Add(1)
-			log.Print("Operation is add")
+
+			if r.PostFormValue("keytext") == "" {
+				pksaddrequesterrors.Add("missing-keytext", 1)
+				http.Error(w, "No key in request object", http.StatusBadRequest)
+				return
+			}
+			err, status = self.Add(r.PostFormValue("keytext"))
+			if err == nil {
+				http.Error(w, "Created", http.StatusCreated)
+			} else {
+				http.Error(w, err.Error(), status)
+			}
 		}
 	case "lookup":
 		{
 			pkslookupreqs.Add(1)
 			log.Print("Operation is lookup")
+			return
 		}
 	}
 }
