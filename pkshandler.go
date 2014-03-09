@@ -32,6 +32,7 @@ package main
 
 import (
 	"database/cassandra"
+	"encoding/hex"
 	"errors"
 	"expvar"
 	"log"
@@ -46,6 +47,7 @@ var pksreqs *expvar.Int = expvar.NewInt("num-pks-reqs")
 var pksunknownreqs *expvar.Int = expvar.NewInt("num-pks-unknown-reqs")
 var pksaddreqs *expvar.Int = expvar.NewInt("num-pks-add-reqs")
 var pkslookupreqs *expvar.Int = expvar.NewInt("num-pks-lookup-reqs")
+var pkslookupkeysfound *expvar.Int = expvar.NewInt("num-pks-lookup-keys-found")
 var pksaddrequesterrors *expvar.Map = expvar.NewMap("num-pkcs-add-request-errors")
 var pksadderrors *expvar.Map = expvar.NewMap("num-pkcs-add-errors")
 
@@ -164,6 +166,78 @@ func (self *PksHandler) Add(keydata string) (int, error) {
 	return http.StatusCreated, nil
 }
 
+// Retrieve the key with the given key ID "keyid" from the database.
+// Returns an error in case of failure and prints the PEM encoded key
+// data to the client otherwise.
+func (self *PksHandler) Get(w http.ResponseWriter, keyid string) error {
+	var cp *cassandra.ColumnParent = cassandra.NewColumnParent()
+	var sp *cassandra.SlicePredicate = cassandra.NewSlicePredicate()
+	var kr *cassandra.KeyRange = cassandra.NewKeyRange()
+	var slices []*cassandra.KeySlice
+	var ire *cassandra.InvalidRequestException
+	var ue *cassandra.UnavailableException
+	var te *cassandra.TimedOutException
+	var ks *cassandra.KeySlice
+	var kid []byte
+	var key, endkey []byte
+	var err error
+	var i int
+
+	kid, err = hex.DecodeString(strings.TrimPrefix(keyid, "0x"))
+	if err != nil {
+		return err
+	}
+
+	// Reverse the key ID. Also, copy it into an end key.
+	for i = len(kid) - 1; i >= 0; i-- {
+		key = append(key, kid[i])
+		endkey = append(endkey, kid[i])
+	}
+	// The end key must be the start key + 1.
+	// If the start key is all 0xFF, the end key should be all 0x00.
+	for i = len(endkey) - 1; i >= 0; i++ {
+		if endkey[i] == 255 {
+			endkey[i] = 0
+		} else {
+			endkey[i] += 1
+			break
+		}
+	}
+
+	cp.ColumnFamily = "keys"
+	sp.ColumnNames = [][]byte{[]byte("keydata")}
+	kr.StartKey = key
+	kr.EndKey = endkey
+
+	slices, ire, ue, te, err = self.client.GetRangeSlices(
+		cp, sp, kr, cassandra.ConsistencyLevel_ONE)
+	if ire != nil {
+		return errors.New(ire.Why)
+	} else if ue != nil {
+		return errors.New("Unavailable")
+	} else if te != nil {
+		return errors.New("Timed out")
+	} else if err != nil {
+		return err
+	}
+	pkslookupkeysfound.Add(int64(len(slices)))
+	// Print all keydata columns to stdout, it's what the user wants.
+	for _, ks = range slices {
+		var cos *cassandra.ColumnOrSuperColumn
+		for _, cos = range ks.Columns {
+			var col = cos.Column
+			if string(col.Name) != "keydata" {
+				log.Print("Got column " + string(col.Name) +
+					" which I didn't ask for?")
+				continue
+			}
+
+			w.Write(col.Value)
+		}
+	}
+	return nil
+}
+
 // HTTP response generator of the PKS handler.
 func (self *PksHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var err error
@@ -223,7 +297,12 @@ func (self *PksHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "lookup":
 		{
 			pkslookupreqs.Add(1)
-			log.Print("Operation is lookup")
+			err = self.Get(w, r.FormValue("search"))
+			if err != nil {
+				log.Print("Error retrieving key " + r.FormValue("searc") +
+					": " + err.Error())
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
 			return
 		}
 	}
