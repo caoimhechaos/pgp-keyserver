@@ -88,7 +88,7 @@ func NewPksHandler(dbserver, keyspace string) (*PksHandler, error) {
 // Add the given "keydata" as a new key to the database. If this fails, a
 // descriptive error message is returned as error and the int is set to
 // the appropriate HTTP response code.
-func (self *PksHandler) Add(keydata string) (error, int) {
+func (self *PksHandler) Add(keydata string) (int, error) {
 	var ts int64 = time.Now().Unix()
 	var entities openpgp.EntityList
 	var entity *openpgp.Entity
@@ -100,7 +100,7 @@ func (self *PksHandler) Add(keydata string) (error, int) {
 	if err != nil {
 		log.Print("Unable to decode armored key ring: ", err)
 		pksaddrequesterrors.Add("invalid-armored-key", 1)
-		return err, http.StatusBadRequest
+		return http.StatusBadRequest, err
 	}
 
 	for _, entity = range entities {
@@ -114,6 +114,8 @@ func (self *PksHandler) Add(keydata string) (error, int) {
 		var te *cassandra.TimedOutException
 
 		// Reverse the fingerprint so it can be used as a key.
+		// TODO(caoimhe): look for existing keys and merge existing
+		// signatures.
 		var rev_fp []byte = make([]byte, len(entity.PrimaryKey.Fingerprint))
 		for i, x := range entity.PrimaryKey.Fingerprint {
 			rev_fp[len(entity.PrimaryKey.Fingerprint)-i-1] = x
@@ -138,29 +140,28 @@ func (self *PksHandler) Add(keydata string) (error, int) {
 			log.Println("Invalid request: ", ire.Why)
 			pksadderrors.Add("invalid-request", 1)
 			err = errors.New(ire.String())
-			return err, http.StatusInternalServerError
+			return http.StatusInternalServerError, err
 		}
 		if ue != nil {
 			log.Println("Unavailable")
 			pksadderrors.Add("unavailable", 1)
 			err = errors.New(ue.String())
-			return err, http.StatusInternalServerError
+			return http.StatusInternalServerError, err
 		}
 		if te != nil {
 			log.Println("Request to database backend timed out")
 			pksadderrors.Add("timeout", 1)
 			err = errors.New(te.String())
-			return err, http.StatusInternalServerError
+			return http.StatusInternalServerError, err
 		}
 		if err != nil {
 			log.Println("Generic error: ", err)
 			pksadderrors.Add("os-error", 1)
 			err = errors.New(err.Error())
-			return err, http.StatusInternalServerError
+			return http.StatusInternalServerError, err
 		}
 	}
-	// FIXME: stub
-	return nil, http.StatusCreated
+	return http.StatusCreated, nil
 }
 
 // HTTP response generator of the PKS handler.
@@ -212,7 +213,7 @@ func (self *PksHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "No key in request object", http.StatusBadRequest)
 				return
 			}
-			err, status = self.Add(r.PostFormValue("keytext"))
+			status, err = self.Add(r.PostFormValue("keytext"))
 			if err == nil {
 				http.Error(w, "Created", http.StatusCreated)
 			} else {
